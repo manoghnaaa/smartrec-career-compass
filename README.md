@@ -2,6 +2,8 @@
 
 An intelligent career-discovery and job recommendation platform powered by Data Science and Machine Learning.
 
+🚀 **Live Web Application:** [smartrec-career-compass.streamlit.app](https://smartrec-career-compass-bbumvwsg25qrvmw5kijuwg.streamlit.app/)
+
 ---
 
 ## 1. Overview
