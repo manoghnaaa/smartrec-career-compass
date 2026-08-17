@@ -414,40 +414,30 @@ def find_model_file(filename):
     if os.path.exists(model_path):
         return model_path
     raise FileNotFoundError(f"Model file '{filename}' not found in the root or model/ directories.")
-
 @st.cache_resource
 def load_all_model_artifacts():
+    # 1. Try standard unpickling first (ideal for standard platforms like Streamlit Cloud / Linux)
     try:
-        # 1. Load job_data
+        import pandas as pd
+        import numpy as np
+        import scipy.sparse as sp
+        
         data_path = find_model_file('job_data.pkl')
         with open(data_path, 'rb') as f:
-            raw_data = PurePythonUnpickler(f).load()
-        
-        df_state = raw_data.state
-        bm = df_state['_mgr']
-        blocks, axes = bm.args
-        
-        # Block 0 is job_id (int64)
-        int_block = blocks[0]
-        buf = int_block.args[0].args[0]
-        row_count = len(buf) // 8
-        job_ids = list(struct.unpack(f'<{row_count}q', buf))
-        
-        # Block 1 is object block (strings)
-        str_block = blocks[1]
-        str_state = str_block.args[0].state
-        strings = str_state[4]
-        
-        # Flattened numpy array of shape (4, 1167) in C-contiguous order
-        categories = strings[0 : row_count]
-        titles = strings[row_count : 2*row_count]
-        descriptions = strings[2*row_count : 3*row_count]
-        skills_raw = strings[3*row_count : 4*row_count]
-        
+            df = pickle.load(f)
+            
+        matrix_path = find_model_file('job_matrix.pkl')
+        with open(matrix_path, 'rb') as f:
+            matrix_sparse = pickle.load(f)
+            
+        cv_path = find_model_file('count_vectorizer.pkl')
+        with open(cv_path, 'rb') as f:
+            cv_obj = pickle.load(f)
+            
+        # Parse data safely from DataFrame
         jobs = []
-        for i in range(row_count):
-            # Parse skill lists safely
-            skill_str = skills_raw[i]
+        for idx, row in df.iterrows():
+            skill_str = row['job_skill_set']
             parsed_skills = []
             try:
                 parsed_skills = ast.literal_eval(skill_str)
@@ -455,83 +445,153 @@ def load_all_model_artifacts():
                 if isinstance(skill_str, list):
                     parsed_skills = skill_str
                 else:
-                    # manual split
                     s = skill_str.strip("[]'\"")
                     parsed_skills = [x.strip().strip("'\"") for x in s.split(",") if x.strip()]
-            
+                    
             jobs.append({
-                'job_id': job_ids[i],
-                'category': categories[i],
-                'job_title': titles[i],
-                'job_description': descriptions[i],
+                'job_id': int(row['job_id']),
+                'category': str(row['category']),
+                'job_title': str(row['job_title']),
+                'job_description': str(row['job_description']),
                 'job_skill_set': parsed_skills
             })
             
-        # 2. Load job_matrix
-        matrix_path = find_model_file('job_matrix.pkl')
-        with open(matrix_path, 'rb') as f:
-            raw_matrix = PurePythonUnpickler(f).load()
+        # Standardize matrix fields
+        if sp.issparse(matrix_sparse):
+            matrix_sparse = matrix_sparse.tocsr()
             
-        state = raw_matrix.state
-        shape = state['_shape']
-        rows, cols = shape
-        
-        indices_bytes = state['indices'].state[4]
-        indices_len = len(indices_bytes) // 4
-        indices = list(struct.unpack(f'<{indices_len}i', indices_bytes))
-        
-        indptr_bytes = state['indptr'].state[4]
-        indptr_len = len(indptr_bytes) // 4
-        indptr = list(struct.unpack(f'<{indptr_len}i', indptr_bytes))
-        
-        data_bytes = state['data'].state[4]
-        data_len = len(data_bytes) // 8
-        data_val = list(struct.unpack(f'<{data_len}q', data_bytes))
-        
         job_matrix = {
-            'shape': shape,
-            'indices': indices,
-            'indptr': indptr,
-            'data': data_val
+            'shape': matrix_sparse.shape,
+            'indices': list(matrix_sparse.indices),
+            'indptr': list(matrix_sparse.indptr),
+            'data': list(matrix_sparse.data)
         }
         
-        # 3. Load count_vectorizer
-        cv_path = find_model_file('count_vectorizer.pkl')
-        with open(cv_path, 'rb') as f:
-            raw_cv = PurePythonUnpickler(f).load()
-            
-        cv_state = raw_cv.state
-        raw_vocab = cv_state['vocabulary_']
-        
-        vocab = {}
-        for word, scalar_obj in raw_vocab.items():
-            scalar_args = scalar_obj.args
-            val_bytes = scalar_args[1]
-            val = struct.unpack('<q', val_bytes)[0]
-            vocab[word] = val
-            
         count_vectorizer = {
-            'vocabulary_': vocab,
-            'lowercase': cv_state.get('lowercase', True),
-            'token_pattern': cv_state.get('token_pattern', r'(?u)\b\w\w+\b')
+            'vocabulary_': cv_obj.vocabulary_,
+            'lowercase': getattr(cv_obj, 'lowercase', True),
+            'token_pattern': getattr(cv_obj, 'token_pattern', r'(?u)\b\w\w+\b')
         }
         
-        # Precompute job norms
-        job_norms = []
-        for i in range(rows):
-            start = indptr[i]
-            end = indptr[i+1]
-            row_data = data_val[start:end]
-            val_sum = sum(v * v for v in row_data)
-            job_norms.append(math.sqrt(val_sum))
-            
-        return jobs, job_matrix, count_vectorizer, job_norms
+        # Precompute job norms using scipy sparse power
+        job_norms = list(np.sqrt(matrix_sparse.power(2).sum(axis=1).A1))
         
-    except Exception as e:
-        st.error(f"Error loading model artifacts: {str(e)}")
-        # Output friendly instructions instead of traceback
-        st.info("Please ensure 'count_vectorizer.pkl', 'job_data.pkl', and 'job_matrix.pkl' are placed in the root directory or a 'model/' folder.")
-        return None, None, None, None
+        return jobs, job_matrix, count_vectorizer, job_norms
+
+    except Exception as std_e:
+        # 2. Fallback to pure-Python unpickler (for local Windows machine running under AppLocker DLL constraints)
+        try:
+            # Load job_data
+            data_path = find_model_file('job_data.pkl')
+            with open(data_path, 'rb') as f:
+                raw_data = PurePythonUnpickler(f).load()
+            
+            df_state = raw_data.state
+            bm = df_state['_mgr']
+            blocks, axes = bm.args
+            
+            # Block 0 is job_id (int64)
+            int_block = blocks[0]
+            buf = int_block.args[0].args[0]
+            row_count = len(buf) // 8
+            job_ids = list(struct.unpack(f'<{row_count}q', buf))
+            
+            # Block 1 is object block (strings)
+            str_block = blocks[1]
+            str_state = str_block.args[0].state
+            strings = str_state[4]
+            
+            # Flattened numpy array of shape (4, 1167) in C-contiguous order
+            categories = strings[0 : row_count]
+            titles = strings[row_count : 2*row_count]
+            descriptions = strings[2*row_count : 3*row_count]
+            skills_raw = strings[3*row_count : 4*row_count]
+            
+            jobs = []
+            for i in range(row_count):
+                skill_str = skills_raw[i]
+                parsed_skills = []
+                try:
+                    parsed_skills = ast.literal_eval(skill_str)
+                except Exception:
+                    if isinstance(skill_str, list):
+                        parsed_skills = skill_str
+                    else:
+                        s = skill_str.strip("[]'\"")
+                        parsed_skills = [x.strip().strip("'\"") for x in s.split(",") if x.strip()]
+                
+                jobs.append({
+                    'job_id': job_ids[i],
+                    'category': categories[i],
+                    'job_title': titles[i],
+                    'job_description': descriptions[i],
+                    'job_skill_set': parsed_skills
+                })
+                
+            # Load job_matrix
+            matrix_path = find_model_file('job_matrix.pkl')
+            with open(matrix_path, 'rb') as f:
+                raw_matrix = PurePythonUnpickler(f).load()
+                
+            state = raw_matrix.state
+            shape = state['_shape']
+            rows, cols = shape
+            
+            indices_bytes = state['indices'].state[4]
+            indices_len = len(indices_bytes) // 4
+            indices = list(struct.unpack(f'<{indices_len}i', indices_bytes))
+            
+            indptr_bytes = state['indptr'].state[4]
+            indptr_len = len(indptr_bytes) // 4
+            indptr = list(struct.unpack(f'<{indptr_len}i', indptr_bytes))
+            
+            data_bytes = state['data'].state[4]
+            data_len = len(data_bytes) // 8
+            data_val = list(struct.unpack(f'<{data_len}q', data_bytes))
+            
+            job_matrix = {
+                'shape': shape,
+                'indices': indices,
+                'indptr': indptr,
+                'data': data_val
+            }
+            
+            # Load count_vectorizer
+            cv_path = find_model_file('count_vectorizer.pkl')
+            with open(cv_path, 'rb') as f:
+                raw_cv = PurePythonUnpickler(f).load()
+                
+            cv_state = raw_cv.state
+            raw_vocab = cv_state['vocabulary_']
+            
+            vocab = {}
+            for word, scalar_obj in raw_vocab.items():
+                scalar_args = scalar_obj.args
+                val_bytes = scalar_args[1]
+                val = struct.unpack('<q', val_bytes)[0]
+                vocab[word] = val
+                
+            count_vectorizer = {
+                'vocabulary_': vocab,
+                'lowercase': cv_state.get('lowercase', True),
+                'token_pattern': cv_state.get('token_pattern', r'(?u)\b\w\w+\b')
+            }
+            
+            # Precompute job norms
+            job_norms = []
+            for i in range(rows):
+                start = indptr[i]
+                end = indptr[i+1]
+                row_data = data_val[start:end]
+                val_sum = sum(v * v for v in row_data)
+                job_norms.append(math.sqrt(val_sum))
+                
+            return jobs, job_matrix, count_vectorizer, job_norms
+            
+        except Exception as fallback_e:
+            st.error(f"Error loading model artifacts: standard loader failed ({str(std_e)}), fallback loader failed ({str(fallback_e)})")
+            st.info("Please ensure 'count_vectorizer.pkl', 'job_data.pkl', and 'job_matrix.pkl' are placed in the root directory or a 'model/' folder.")
+            return None, None, None, None
 
 # Reusable Recommendation Function
 def get_recommendations(skills_list, preferred_role, preferred_category, jobs, matrix, cv, job_norms, limit=10):
